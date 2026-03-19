@@ -158,7 +158,7 @@ func main() {
 							continue
 						}
 
-						// Не зарегистрирован → сразу предлагаем кнопку
+						// Не зарегистрирован - сразу предлагаем кнопку
 						contactBtn := maxigo.NewRequestContactButton("📱 Регистрация")
 
 						keyboard := maxigo.NewInlineKeyboardAttachment([][]maxigo.Button{
@@ -177,7 +177,7 @@ func main() {
 						continue
 					}
 
-					// Зарегистрирован → обычный ответ
+					// Зарегистрирован - обычный ответ
 					_, err := client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
 						Text: maxigo.Some(fmt.Sprintf("Привет, %s! ✨\nПолучил: «%s»\nТвой номер уже сохранён (%s)", senderName, text, phone)),
 					})
