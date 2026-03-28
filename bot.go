@@ -120,7 +120,7 @@ func handleMessageCreated(client *maxigo.Client, ctx context.Context, raw []byte
 
 	fmt.Printf("Сообщение от %s (UserID %d): %s\n", senderName, userID, text)
 
-	phone, isRegistered := registeredUsers[userID]
+	phone, isRegistered := registeredUsers[chatID]
 	registrationJustHappened := false
 
 	// Обработка контакта
@@ -131,6 +131,27 @@ func handleMessageCreated(client *maxigo.Client, ctx context.Context, raw []byte
 	}
 
 	if registrationJustHappened {
+		return
+	}
+
+	if strings.HasPrefix(text, "/m") {
+		// Проверяем, зарегистрирован ли пользователь
+		if !isRegistered {
+			_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+				Text: maxigo.Some("❌ Сначала зарегистрируйтесь с помощью кнопки \"Регистрация\""),
+			})
+			return
+		}
+
+		// Проверяем, является ли пользователь админом по телефону
+		if !isAdminByPhone(phone) {
+			_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+				Text: maxigo.Some("⛔ У вас нет прав для использования этой команды. Команда доступна только администраторам."),
+			})
+			return
+		}
+
+		handleSearchCommand(client, ctx, chatID, text)
 		return
 	}
 
@@ -165,6 +186,70 @@ func handleCallback(client *maxigo.Client, ctx context.Context, raw []byte) {
 		handleLinkedPhones(client, ctx, chatID)
 	case "contacts":
 		sendContacts(client, ctx, chatID)
+	}
+}
+
+func handleSearchCommand(client *maxigo.Client, ctx context.Context, chatID int64, command string) {
+	// Разбираем команду: "/m номер_гаража" или "/m фамилия"
+	parts := strings.SplitN(command, " ", 2)
+	if len(parts) < 2 {
+		_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+			Text: maxigo.Some("ℹ️ Использование команды:\n/m [номер гаража] - поиск по номеру\n/m [фамилия] - поиск по фамилии\n\nПримеры:\n/m 123\n/m Иванов"),
+		})
+		return
+	}
+
+	searchQuery := strings.TrimSpace(parts[1])
+	if searchQuery == "" {
+		_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+			Text: maxigo.Some("❌ Введите номер гаража или фамилию для поиска"),
+		})
+		return
+	}
+
+	// Отправляем уведомление о начале поиска
+	_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+		Text: maxigo.Some(fmt.Sprintf("🔍 Ищу по запросу: %s...", searchQuery)),
+	})
+
+	// Выполняем поиск
+	results := readRowData(searchQuery)
+
+	if len(results) == 0 {
+		_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+			Text: maxigo.Some(fmt.Sprintf("❌ Ничего не найдено по запросу: %s", searchQuery)),
+		})
+		return
+	}
+
+	// Отправляем результаты
+	if len(results) == 1 {
+		formattedText := formatGarageData(results[0])
+		_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+			Text: maxigo.Some(fmt.Sprintf("📋 Результат поиска:\n\n%s", formattedText)),
+		})
+	} else {
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("🔍 Найдено %d результатов:\n\n", len(results)))
+		for i, data := range results {
+			if i >= 100 { // ограничиваем количество результатов
+				sb.WriteString(fmt.Sprintf("\n... и еще %d результатов", len(results)-10))
+				break
+			}
+
+			// Получаем значение из столбца "Гараж, ФИО"
+			garageFIO := data["Гараж, ФИО"]
+			if garageFIO == "" {
+				garageFIO = "?"
+			}
+
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, garageFIO))
+		}
+		sb.WriteString("\nИспользуйте /m [номер] для получения полной информации")
+
+		_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+			Text: maxigo.Some(sb.String()),
+		})
 	}
 }
 
@@ -293,8 +378,7 @@ func sendContacts(client *maxigo.Client, ctx context.Context, chatID int64) {
 
 Председатель: Архипкин Михаил Вячеславович
 Тел: +79109061411, +79511013775
-
-Администрация бота: @slaav1k`
+`
 
 	_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{Text: maxigo.Some(text)})
 }
@@ -504,51 +588,105 @@ func searchInNumbers(searchQuery string) string {
 
 // formatGarageData форматирует данные гаража для вывода
 func formatGarageData(data map[string]string) string {
-	// Желаемый порядок полей (только те, которые важны)
-	order := []string{
-		"№",
-		"Гараж",
-		"ФИО",
-		"Должник",
-		"Должен за 2026",
-		"Должен за 2025",
-		"Должен за 2024",
-		"Должен за 2023",
-		"Должен за 2022",
-		"Должен за 2021",
-		"Оплатил в 2026",
-		"Оплатил 2026",
-		"Дата оплаты",
-		"Остаток долга",
-		"Показания счетчиков",
-		"Новые показания счетчиков",
-		"Нажгли на",
-		"Адрес",
-		"Номер телефона",
-		"Примечание",
+	// Желаемый порядок полей
+	order := []struct {
+		key      string
+		label    string
+		priority int
+	}{
+		{"№", "№", 1},
+		{"Гараж, ФИО", "Гараж, ФИО", 2},
+		{"Показания счетчиков", "Показания счетчиков", 3},
+		{"Новые показания счетчиков", "Новые показания счетчиков", 4},
+		{"Нажгли на", "Нажгли на", 5},
+		{"Общий долг", "Общий долг", 6},
+		{"Должен за 2026", "Должен за 2026", 7},
+		{"Должен за 2025", "Должен за 2025", 8},
+		{"Должен за 2024", "Должен за 2024", 9},
+		{"Должен за 2023", "Должен за 2023", 10},
+		{"Должен за 2022", "Должен за 2022", 11},
+		{"Должен за 2021", "Должен за 2021", 12},
+		{"Должен до 2021", "Должен до 2021", 13},
+		{"Оплатил в 2026", "Оплатил в 2026", 14},
+		{"Остаток долга", "Остаток долга", 15},
+		{"Дата оплаты", "Дата оплаты", 16},
+		{"Должник", "Должник", 17},
+		{"Адрес", "Адрес", 18},
+		{"Номер телефона", "Номер телефона", 19},
+		{"Примечание", "Примечание", 20},
 	}
 
 	var sb strings.Builder
-	for _, key := range order {
-		if val, ok := data[key]; ok && val != "" && val != "—" {
-			// Очищаем ключ от возможных скрытых символов
-			cleanKey := strings.TrimSpace(key)
-			// Убираем точку в конце номера гаража
-			if cleanKey == "№" && strings.HasSuffix(val, ".") {
-				val = strings.TrimSuffix(val, ".")
+
+	// Выводим остальные поля в заданном порядке
+	for _, field := range order {
+		// Пропускаем уже выведенные поля
+		//if field.key == "№" || field.key == "Гараж" || field.key == "ФИО" {
+		//	continue
+		//}
+
+		// Получаем значение
+		val, ok := data[field.key]
+		if !ok {
+			// Пробуем альтернативные названия
+			if field.key == "Оплатил в 2026" {
+				val, ok = data["Оплатил 2026"]
+			} else if field.key == "Оплатил в 2025" {
+				val, ok = data["Оплатил 2025"]
+			} else if field.key == "Оплатил в 2024" {
+				val, ok = data["Оплатил 2024"]
+			} else if field.key == "Оплатил в 2023" {
+				val, ok = data["Оплатил 2023"]
+			} else if field.key == "Оплатил в 2022" {
+				val, ok = data["Оплатил 2022"]
+			} else if field.key == "Оплатил в 2021" {
+				val, ok = data["Оплатил 2021"]
 			}
-			sb.WriteString(fmt.Sprintf("%s: %s\n", cleanKey, val))
 		}
+
+		// Пропускаем пустые значения и прочерки
+		if !ok || val == "" || val == "—" {
+			continue
+		}
+
+		// Пропускаем нулевые значения для некоторых полей
+		if (field.key == "Нажгли на" || strings.Contains(field.key, "Должен за") ||
+			strings.Contains(field.key, "Оплатил в")) && val == "0" {
+			continue
+		}
+
+		// Выводим поле
+		sb.WriteString(fmt.Sprintf("%s: %s\n", field.label, val))
 	}
 
 	// Если ничего не вывели, показываем всё, что есть
 	if sb.Len() == 0 {
 		for k, v := range data {
-			if v != "" && v != "0" {
+			if v != "" && v != "0" && v != "—" {
 				sb.WriteString(fmt.Sprintf("%s: %s\n", k, v))
 			}
 		}
 	}
 
 	return sb.String()
+}
+
+func isAdminByPhone(phone string) bool {
+	phone = strings.TrimPrefix(phone, "+")
+	phone = strings.ReplaceAll(phone, " ", "")
+	phone = strings.ReplaceAll(phone, "-", "")
+
+	// Список телефонов администраторов
+	adminPhones := []string{
+		"79109061411",
+		"79106114058",
+	}
+
+	for _, adminPhone := range adminPhones {
+		if phone == adminPhone {
+			return true
+		}
+	}
+
+	return false
 }
