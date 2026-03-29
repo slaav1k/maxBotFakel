@@ -136,10 +136,9 @@ func handleMessageCreated(client *maxigo.Client, ctx context.Context, raw []byte
 
 	if strings.HasPrefix(text, "/m") {
 		// Проверяем, зарегистрирован ли пользователь
+		// Везде, где есть проверка isRegistered
 		if !isRegistered {
-			_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
-				Text: maxigo.Some("❌ Сначала зарегистрируйтесь с помощью кнопки \"Регистрация\""),
-			})
+			sendRegistrationRequiredMessage(client, ctx, chatID)
 			return
 		}
 
@@ -152,6 +151,29 @@ func handleMessageCreated(client *maxigo.Client, ctx context.Context, raw []byte
 		}
 
 		handleSearchCommand(client, ctx, chatID, text)
+		sendRegisteredMenu(client, ctx, chatID)
+		return
+	}
+
+	// Добавляем обработку команды /f
+	if strings.HasPrefix(text, "/f") {
+		// Проверяем, зарегистрирован ли пользователь
+		// Везде, где есть проверка isRegistered
+		if !isRegistered {
+			sendRegistrationRequiredMessage(client, ctx, chatID)
+			return
+		}
+
+		// Проверяем, является ли пользователь админом по телефону
+		if !isAdminByPhone(phone) {
+			_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+				Text: maxigo.Some("⛔ У вас нет прав для использования этой команды. Команда доступна только администраторам."),
+			})
+			return
+		}
+
+		handlePhoneInfoCommand(client, ctx, chatID, text)
+		sendRegisteredMenu(client, ctx, chatID)
 		return
 	}
 
@@ -182,10 +204,13 @@ func handleCallback(client *maxigo.Client, ctx context.Context, raw []byte) {
 	switch data {
 	case "status":
 		handleStatus(client, ctx, chatID)
+		sendRegisteredMenu(client, ctx, chatID)
 	case "linked":
 		handleLinkedPhones(client, ctx, chatID)
+		sendRegisteredMenu(client, ctx, chatID)
 	case "contacts":
 		sendContacts(client, ctx, chatID)
+		sendRegisteredMenu(client, ctx, chatID)
 	}
 }
 
@@ -251,6 +276,41 @@ func handleSearchCommand(client *maxigo.Client, ctx context.Context, chatID int6
 			Text: maxigo.Some(sb.String()),
 		})
 	}
+}
+
+// handlePhoneInfoCommand обрабатывает команду /f для поиска информации по номеру гаража в numbers.csv
+func handlePhoneInfoCommand(client *maxigo.Client, ctx context.Context, chatID int64, command string) {
+	// Разбираем команду: "/f номер_гаража"
+	parts := strings.SplitN(command, " ", 2)
+	if len(parts) < 2 {
+		_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+			Text: maxigo.Some("ℹ️ Использование команды:\n/f [номер гаража] - поиск информации по номеру гаража\n\nПример:\n/f 413"),
+		})
+		return
+	}
+
+	garageNumber := strings.TrimSpace(parts[1])
+	if garageNumber == "" {
+		_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+			Text: maxigo.Some("❌ Введите номер гаража для поиска"),
+		})
+		return
+	}
+
+	// Убираем точку в конце, если есть
+	garageNumber = strings.TrimRight(garageNumber, ".")
+
+	// Отправляем уведомление о начале поиска
+	_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+		Text: maxigo.Some(fmt.Sprintf("🔍 Ищу информацию по гаражу №%s...", garageNumber)),
+	})
+
+	// Ищем в numbers.csv
+	result := searchInNumbers(garageNumber)
+
+	_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+		Text: maxigo.Some(fmt.Sprintf("📋 Информация по гаражу №%s:\n\n%s", garageNumber, result)),
+	})
 }
 
 // ======================= МЕНЮ =======================
@@ -363,7 +423,7 @@ func handleLinkedPhones(client *maxigo.Client, ctx context.Context, chatID int64
 	}
 
 	for _, box := range boxes {
-		// Ищем строку с этим гаражом в numbers.csv
+		// box уже без точки из getLSBoxes
 		result := searchInNumbers(box)
 		_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
 			Text: maxigo.Some(fmt.Sprintf("Гараж № %s:\n%s", box, result)),
@@ -402,7 +462,7 @@ func getLSBoxes(phone string) []string {
 
 	reader := csv.NewReader(file)
 	reader.Comma = ';'
-	reader.FieldsPerRecord = -1 // разрешаем разное количество полей
+	reader.FieldsPerRecord = -1
 
 	rows, err := reader.ReadAll()
 	if err != nil {
@@ -418,8 +478,12 @@ func getLSBoxes(phone string) []string {
 		for _, cell := range row {
 			// Ищем номер телефона в ячейке
 			if strings.Contains(cell, phone) {
-				// Берем первый столбец (номер гаража)
+				// Берем первый столбец (номер гаража) и очищаем
 				garageNum := strings.TrimSpace(row[0])
+				// Удаляем BOM если есть
+				garageNum = strings.TrimPrefix(garageNum, "\uFEFF")
+				// Убираем точку в конце
+				garageNum = strings.TrimRight(garageNum, ".")
 				if garageNum != "" {
 					found = append(found, garageNum)
 				}
@@ -555,35 +619,60 @@ func searchInNumbers(searchQuery string) string {
 		return "Ошибка чтения файла"
 	}
 
-	if len(rows) == 0 {
-		return "Файл пуст"
+	if len(rows) < 2 {
+		return "Файл пуст или нет данных"
 	}
 
-	// Ищем во всех строках
-	for i, row := range rows {
-		for _, cell := range row {
-			if strings.Contains(cell, searchQuery) {
-				// Форматируем вывод
-				if i == 0 {
-					// Заголовок
-					var sb strings.Builder
-					for _, h := range row {
-						sb.WriteString(strings.TrimSpace(h) + " | ")
-					}
-					return sb.String()
+	// Заголовки - первая строка
+	headers := make([]string, len(rows[0]))
+	for i, h := range rows[0] {
+		headers[i] = strings.TrimSpace(h)
+	}
+
+	// Ищем в данных (со второй строки)
+	for i := 1; i < len(rows); i++ {
+		row := rows[i]
+
+		if len(row) == 0 {
+			continue
+		}
+
+		// Очищаем номер гаража от всех лишних символов
+		garageNum := strings.TrimSpace(row[0])
+		// Удаляем BOM если есть
+		garageNum = strings.TrimPrefix(garageNum, "\uFEFF")
+		// Убираем точку в конце
+		garageNum = strings.TrimRight(garageNum, ".")
+		// Убираем все точки и лишние пробелы
+		garageNum = strings.TrimSpace(garageNum)
+
+		//log.Printf("Сравниваем: garageNum='%s' с searchQuery='%s'", garageNum, searchQuery)
+
+		if garageNum == searchQuery {
+			// Форматируем вывод с названиями столбцов
+			var sb strings.Builder
+
+			for j, header := range headers {
+				var value string
+				if j < len(row) {
+					value = strings.TrimSpace(row[j])
+					// Удаляем BOM из значения если есть
+					value = strings.TrimPrefix(value, "\uFEFF")
 				} else {
-					// Данные
-					var sb strings.Builder
-					for _, v := range row {
-						sb.WriteString(strings.TrimSpace(v) + " | ")
-					}
-					return sb.String()
+					value = ""
+				}
+
+				// Показываем только непустые значения
+				if value != "" {
+					sb.WriteString(fmt.Sprintf("%s - %s\n", header, value))
 				}
 			}
+
+			return sb.String()
 		}
 	}
 
-	return "Не найдено"
+	return fmt.Sprintf("Гараж №%s не найден в базе", searchQuery)
 }
 
 // formatGarageData форматирует данные гаража для вывода
@@ -689,4 +778,12 @@ func isAdminByPhone(phone string) bool {
 	}
 
 	return false
+}
+
+// sendRegistrationRequiredMessage отправляет сообщение о необходимости регистрации с кнопкой
+func sendRegistrationRequiredMessage(client *maxigo.Client, ctx context.Context, chatID int64) {
+	_, _ = client.SendMessage(ctx, chatID, &maxigo.NewMessageBody{
+		Text: maxigo.Some("❌ Сначала зарегистрируйтесь, чтобы использовать эту команду"),
+	})
+	sendRegistrationMenu(client, ctx, chatID)
 }
